@@ -128,7 +128,7 @@ it once was. Ultimately, this is a sourcing issue.
 ```mermaid
 flowchart TD
     A["Document Ingestion
-    Reddit threads (PRAW / manual)
+    Reddit threads (manual)
     Articles (BeautifulSoup)"] 
     --> B["Chunking
     Reddit: 1 comment = 1 chunk
