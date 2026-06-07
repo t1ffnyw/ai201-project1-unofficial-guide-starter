@@ -94,6 +94,8 @@ KNOWN_RESTAURANTS = {
     "The Prime Rib", "The Urban Oyster", "The Wren",
     "True Chesapeake",
     "W.C. Harlan", "Woodberry Kitchen", "Woodberry Tavern", "Wye Oak Tavern",
+    "Alexander's Tavern", "Dukem", "Tabor", "Ma'aed", "Lalibela",
+    "The Ethiopian Place", "Koopers", "Faidley's",
 }
 
 # Normalise text for matching: lowercase + remove apostrophes/curly quotes.
@@ -285,7 +287,9 @@ def _extract_markdown_name(line):
     rest = _MD_HEADER_RE.sub("", line).strip()
     m = _MD_LINK_RE.match(rest)
     name = m.group(1) if m else (rest or None)
-    if name and (len(name) > 80 or ";" in name):
+    if not name:
+        return None
+    if len(name) > 80 or ";" in name:
         return None
     # "By the Numbers" entries like "#### 350" or "#### 24,000"
     try:
@@ -293,8 +297,19 @@ def _extract_markdown_name(line):
         return None
     except (ValueError, AttributeError):
         pass
+    if _is_page_title(name):
+        return None
     return name
 
+
+# Substrings that mark page/guide titles rather than restaurant names.
+_PAGE_TITLE_PATTERNS = (
+    "Top Eateries", "Date Night Destinations", "Essential Restaurants",
+    "Best Breakfast", "Best Seafood", "Crab Cakes",
+    "Budget-Friendly", "in Baltimore", "Where to Find",
+    "Where to Eat", "International Dining", "Asian-Owned",
+    "Vegan", "Vegetarian", "Waterfront Dining",
+)
 
 # Words that mark category/section headers rather than restaurant names.
 _SECTION_KEYWORDS = frozenset({
@@ -305,8 +320,39 @@ _SECTION_KEYWORDS = frozenset({
 # Explicit short strings that pass other checks but are not restaurant names.
 _SKIP_NAMES = frozenset({
     "Forever Dishes", "Read More", "Swap Out the Swine",
-    "Last Updated", "By the Numbers",
+    "Last Updated", "By the Numbers", "MEET THE CHEF",
+    "Seasonal dishes that are here to stay",
 })
+
+_BULLET_RE = re.compile(r"^-\s+(.+?)\s+[–\-]\s+(.+)$")
+_NEIGHBORHOOD_RE = re.compile(r"^(.+?)\s+Restaurants$")
+
+
+def _is_page_title(line):
+    """True if line is an article/page title or guide header, not a restaurant name."""
+    line = line.strip()
+    if any(p in line for p in _PAGE_TITLE_PATTERNS):
+        return True
+    return any(line.startswith(skip) for skip in _SKIP_NAMES)
+
+
+def _parse_bullet_restaurant(line):
+    """Parse '- Restaurant Name – description' bullet lines (neighborhood guides)."""
+    m = _BULLET_RE.match(line.strip())
+    if not m:
+        return None
+    name, body = m.group(1).strip(), m.group(2).strip()
+    if len(name) > 60 or _is_page_title(name):
+        return None
+    return name, body
+
+
+def _parse_neighborhood_header(line):
+    """Parse 'Canton Restaurants' style neighborhood section headers."""
+    m = _NEIGHBORHOOD_RE.match(line.strip())
+    if not m or _is_page_title(line):
+        return None
+    return m.group(1).strip()
 
 
 def _looks_like_name(line):
@@ -318,11 +364,16 @@ def _looks_like_name(line):
         return False
     if line.startswith("#") or line.startswith("*"):
         return False
+    if _is_page_title(line):
+        return False
     # All-caps lines are neighborhood/section headers (HARBOR EAST, MEET THE CHEF, etc.)
     if line.replace(" ", "").replace("'", "").isupper():
         return False
     # Category/section headers: "Romantic Restaurants", "Serene Spas", "Bolton Hill Restaurants"…
     if set(line.split()) & _SECTION_KEYWORDS:
+        return False
+    # Subsection headers: "Budget Breakfasts in Baltimore", "Hefty Happy Hours & Small Bites"
+    if " in Baltimore" in line or "&" in line:
         return False
     # "Dish at Restaurant" lines and activity lines ("Stargaze at …", "Explore … by boat")
     if " at " in line:
@@ -330,78 +381,101 @@ def _looks_like_name(line):
     # Chef attribution lines: "Carlos Raba, chef of Nana"
     if "chef of" in line.lower():
         return False
-    # Explicit edge-case skip list
-    if any(line.startswith(skip) for skip in _SKIP_NAMES):
-        return False
     # Mostly a proper-noun heading: starts uppercase, not a full sentence.
     return line[0].isupper() and len(line.split()) <= 8
 
 
 def chunk_article(doc_id, meta, body):
     """One chunk per restaurant section; sections over the cap recursively split."""
-    # Scan line by line: a "name" line (short, title-like, no terminal punctuation) opens a
-    # new restaurant section; the lines after it are its description, until the next name.
-    # This handles both blank-line-separated layouts and single-newline lists (crab cakes),
-    # where every restaurant name and description sit on adjacent lines in one paragraph.
-    sections = []  # list of (name_or_None, [body lines])
+    sections = []  # list of (name_or_None, [body lines], neighborhood_or_None)
     name, desc = None, []
+    current_neighborhood = None
+    seen_restaurant = False
+
+    def _flush_section():
+        nonlocal name, desc
+        if name is not None or desc:
+            sections.append((name, desc, current_neighborhood))
+        name, desc = None, []
+
+    def _mark_restaurant(rest_name, rest_desc=None):
+        nonlocal name, desc, seen_restaurant
+        _flush_section()
+        seen_restaurant = True
+        name, desc = rest_name, rest_desc if rest_desc is not None else []
+
     for line in body.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("[extracted via"):
             continue
-        # Horizontal dividers (e.g. "* * *") close the current section without
-        # opening a named one — content after the divider becomes a fresh unnamed
-        # section so scraper-boundary gaps (Clavel, Duchess) don't inherit the
-        # preceding restaurant's name.
-        if stripped in ("* * *", "---", "* * * * *"):
-            if name is not None or desc:
-                sections.append((name, desc))
-            name, desc = None, []
+
+        # Table-of-contents neighborhood links: "- Brewers Hill Restaurants"
+        if stripped.startswith("- ") and stripped.rstrip().endswith("Restaurants"):
             continue
+
+        if stripped in ("* * *", "---", "* * * * *"):
+            _flush_section()
+            continue
+
+        neighborhood = _parse_neighborhood_header(stripped)
+        if neighborhood:
+            _flush_section()
+            current_neighborhood = neighborhood
+            continue
+
+        bullet = _parse_bullet_restaurant(stripped)
+        if bullet:
+            _mark_restaurant(bullet[0], [bullet[1]])
+            continue
+
         md_name = _extract_markdown_name(stripped)
         if md_name:
-            if name is not None or desc:
-                sections.append((name, desc))
-            name, desc = md_name, []
-        elif _looks_like_name(stripped):
-            if name is not None or desc:
-                sections.append((name, desc))
-            name, desc = stripped, []
-        else:
-            desc.append(stripped)
+            _mark_restaurant(md_name)
+            continue
+
+        if _looks_like_name(stripped):
+            _mark_restaurant(stripped)
+            continue
+
+        if not seen_restaurant:
+            continue  # discard intro preamble before first restaurant
+
+        desc.append(stripped)
+
     if name is not None or desc:
-        sections.append((name, desc))
+        sections.append((name, desc, current_neighborhood))
 
-    # Assemble each section's text (name kept as the first line so the leading split piece
-    # already carries it). Drop name-only sections that never got a description.
-    sections = [
-        (name, "\n".join(([name] if name else []) + desc).strip())
-        for name, desc in sections
-        if desc  # drop empty stubs produced by divider resets or name-only lines
-    ]
+    # Assemble section text; drop preamble stubs (never reached seen_restaurant).
+    assembled = []
+    for sec_name, sec_desc, sec_neighborhood in sections:
+        if not sec_desc:
+            continue
+        if sec_name is None and not seen_restaurant:
+            continue
+        body_lines = ([sec_name] if sec_name else []) + sec_desc
+        text = "\n".join(body_lines).strip()
+        if sec_neighborhood:
+            text = f"[{sec_neighborhood}] {text}"
+        assembled.append((sec_name, text))
 
-    if not sections:
-        # No structure detected — fall back to recursive split of the whole body.
+    if not assembled:
         sections = [(None, body)]
+    else:
+        sections = assembled
 
-    # The metadata prefix is added to every chunk's text, so reserve room for it when
-    # deciding whether a section fits under the cap.
     reserve = len(context_prefix(meta))
     chunks, n = [], 0
-    for name, text in sections:
+    for sec_name, text in sections:
         if len(text) <= ARTICLE_CAP - reserve:
-            chunks.append(make_chunk(doc_id, n, meta, text, restaurant=name))
+            chunks.append(make_chunk(doc_id, n, meta, text, restaurant=sec_name))
             n += 1
         else:
-            # Shrink the split target so the final text (context prefix + re-prepended
-            # name + piece + overlap) still fits under the cap.
-            name_prefix = f"{name}: " if name else ""
+            name_prefix = f"{sec_name}: " if sec_name else ""
             target = min(ARTICLE_TARGET, ARTICLE_CAP - reserve - len(name_prefix) - OVERLAP)
             for piece in recursive_split(text, target=target):
-                # Re-prepend the name so context survives the split boundary.
-                if name and not piece.startswith(name):
+                if sec_name and not piece.startswith(sec_name):
                     piece = f"{name_prefix}{piece}"
-                chunks.append(make_chunk(doc_id, n, meta, piece, restaurant=name))
+                chunks.append(make_chunk(doc_id, n, meta, piece, restaurant=sec_name))
                 n += 1
     return chunks
 
@@ -438,6 +512,8 @@ def main():
     over_reddit_cap = sum(1 for n in lengths if n > REDDIT_CAP)
     print(f"\nWrote {len(all_chunks)} chunks -> {OUTPUT_PATH}")
     print(f"  by type: reddit={per_type['reddit']}, article={per_type['article']}")
+    null_restaurant = sum(1 for c in all_chunks if c["type"] == "article" and not c["restaurant"])
+    print(f"  article chunks with restaurant=null: {null_restaurant}")
     if lengths:
         print(f"  chunk length: min={min(lengths)} median={int(statistics.median(lengths))} max={max(lengths)}")
         print(f"  over {ARTICLE_TARGET}-char article target: {over_article_target}  |  over {REDDIT_CAP}-char Reddit cap: {over_reddit_cap}")
